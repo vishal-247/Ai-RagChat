@@ -25,10 +25,11 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
+    # print(request.files["file"])
+    file = request.files['file']
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
 
-    file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
@@ -42,7 +43,7 @@ def upload_pdf():
             'name': filename,
             'size': os.path.getsize(filepath),
             'path': filepath,
-            'chunks': process_pdf(file),  # TODO: populate after chunking
+            'chunks': process_pdf(filepath,filename),  # TODO: populate after chunking
         }
         uploaded_docs.append(doc)
 
@@ -63,6 +64,8 @@ def list_documents():
     return jsonify({'documents': uploaded_docs})
 
 
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.get_json()
@@ -72,14 +75,16 @@ def chat():
     user_message = data['message']
     history = data.get('history', [])
 
-    # TODO: Add your RAG pipeline here:
-    # 1. Retrieve relevant chunks from ChromaDB
-    results = collection.query(query_texts=[user_message], n_results=4)
-    chunks = results["documents"][0]        # list of matching text chunks
-    metadatas = results["metadatas"][0]     # their metadata
+    # 1. ChromaDB se relevant chunks lo
+    import chromadb
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    collection = chroma_client.get_or_create_collection("documents")
 
-    #   1. Embed the user query
-       # 2. Build context string from retrieved chunks
+    results = collection.query(query_texts=[user_message], n_results=4)
+    chunks = results["documents"][0]
+    metadatas = results["metadatas"][0]
+
+    # 2. Context banao
     if chunks:
         context_parts = []
         for i, (chunk, meta) in enumerate(zip(chunks, metadatas), 1):
@@ -89,56 +94,80 @@ def chat():
     else:
         context = "No relevant documents found."
 
-    # 3. Build the system prompt
-    system_prompt = """You are a helpful assistant that answers questions based on provided document context.
-    
+    # 3. System prompt
+    system_prompt = f"""You are a helpful assistant that answers questions based on provided document context.
+
 Rules:
 - Answer using ONLY the information in the context below.
 - If the context doesn't contain enough information, say so clearly.
-- Always cite which source(s) you used (e.g. "According to report.pdf...").
+- Always cite which source(s) you used.
 - Be concise and accurate.
 
 Context:
-""" + context
+{context}"""
 
-    # 4. Build message history for Claude (convert frontend history format)
-    messages = []
-    for turn in history[:-1]:  # exclude the latest user message, we add it fresh
-        if turn.get("role") in ("user", "assistant"):
-            messages.append({"role": turn["role"], "content": turn["content"]})
-    messages.append({"role": "user", "content": user_message})
+    # 4. ✅ Gemini format mein history convert karo
+    gemini_messages = []
+    recent_history=history[-5:-1]
+    for turn in recent_history:  # last message chhodo, neeche add karenge
+        role = turn.get("role", "")
+        # frontend "content" key bhejta hai, Gemini ko "parts" chahiye
+        text = turn.get("content") or turn.get("parts", [{}])[0].get("text", "")
+        if not text:
+            continue
+        if role == "user":
+            gemini_messages.append({"role": "user", "parts": [{"text": text}]})
+        elif role in ("assistant", "model"):
+            gemini_messages.append({"role": "model", "parts": [{"text": text}]})
+
+    # Current user message add karo
+    gemini_messages.append({"role": "user", "parts": [{"text": user_message}]})
+
+    # # 5. Gemini call
+    # from google import genai
+    # from google.genai import types
+    # from dotenv import load_dotenv
+    # load_dotenv()
+
+    # api_key = os.getenv("GEMINI_API_KEY")
+    # client = genai.Client(api_key=api_key)
+
+    # response = client.models.generate_content(
+    #     model="gemini-2.0-flash-lite",
+    #     contents=gemini_messages,
+    #     config=types.GenerateContentConfig(
+    #         system_instruction=system_prompt
+    #     )
+    # )
+
+    # reply = response.text
 
 
-    # llm call
-    import os
-    from google import genai
+    # 5. Groq call
+    from groq import Groq
     from dotenv import load_dotenv
-
-
     load_dotenv()
 
-    API_KEY = os.getenv("GEMINI_API_KEY")
-    if not API_KEY:
-        raise SystemExit(
-            "Missing GEMINI_API_KEY. Create a .env file or set the environment variable."
-        )
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # Groq OpenAI-style messages use karta hai
+    groq_messages = [{"role": "system", "content": system_prompt}] + [
+        {"role": turn["role"] if turn["role"] != "model" else "assistant",
+         "content": turn["parts"][0]["text"]}
+        for turn in gemini_messages
+    ]
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash", messages=[{"role":"system","content":system_prompt}]+messages,
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",  # ya "mixtral-8x7b-32768"
+        messages=groq_messages,
+        max_tokens=1024,
     )
-    
-
-    # --- Placeholder response ---
 
     reply = response.choices[0].message.content
 
-    return jsonify({
-        'reply': reply,
-        'sources': [],  # TODO: return retrieved chunk sources
-    })
+    sources = list(set(m.get("source", "") for m in metadatas if m.get("source")))
 
+    return jsonify({'reply': reply, 'sources': sources})
 
 @app.route('/documents/<int:doc_id>', methods=['DELETE'])
 def delete_document(doc_id):
