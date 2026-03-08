@@ -2,6 +2,8 @@ import os
 import json
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
+from .backend.extract_text_and_chunk import process_pdf
+
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -40,11 +42,12 @@ def upload_pdf():
             'name': filename,
             'size': os.path.getsize(filepath),
             'path': filepath,
-            'chunks': 0,  # TODO: populate after chunking
+            'chunks': process_pdf(file),  # TODO: populate after chunking
         }
         uploaded_docs.append(doc)
 
         # TODO: Add your RAG pipeline here:
+        
         #   1. Extract text (e.g. PyMuPDF / pdfplumber)
         #   2. Chunk the text
         #   3. Embed chunks (e.g. OpenAI / sentence-transformers)
@@ -70,17 +73,66 @@ def chat():
     history = data.get('history', [])
 
     # TODO: Add your RAG pipeline here:
+    # 1. Retrieve relevant chunks from ChromaDB
+    results = collection.query(query_texts=[user_message], n_results=4)
+    chunks = results["documents"][0]        # list of matching text chunks
+    metadatas = results["metadatas"][0]     # their metadata
+
     #   1. Embed the user query
-    #   2. Retrieve top-k relevant chunks from vector DB
-    #   3. Build a context-augmented prompt
-    #   4. Call your LLM (e.g. OpenAI, Claude, etc.)
-    #   5. Return the response
+       # 2. Build context string from retrieved chunks
+    if chunks:
+        context_parts = []
+        for i, (chunk, meta) in enumerate(zip(chunks, metadatas), 1):
+            source = meta.get("source", "unknown")
+            context_parts.append(f"[{i}] (from {source})\n{chunk}")
+        context = "\n\n".join(context_parts)
+    else:
+        context = "No relevant documents found."
+
+    # 3. Build the system prompt
+    system_prompt = """You are a helpful assistant that answers questions based on provided document context.
+    
+Rules:
+- Answer using ONLY the information in the context below.
+- If the context doesn't contain enough information, say so clearly.
+- Always cite which source(s) you used (e.g. "According to report.pdf...").
+- Be concise and accurate.
+
+Context:
+""" + context
+
+    # 4. Build message history for Claude (convert frontend history format)
+    messages = []
+    for turn in history[:-1]:  # exclude the latest user message, we add it fresh
+        if turn.get("role") in ("user", "assistant"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+
+    # llm call
+    import os
+    from google import genai
+    from dotenv import load_dotenv
+
+
+    load_dotenv()
+
+    API_KEY = os.getenv("GEMINI_API_KEY")
+    if not API_KEY:
+        raise SystemExit(
+            "Missing GEMINI_API_KEY. Create a .env file or set the environment variable."
+        )
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash", messages=[{"role":"system","content":system_prompt}]+messages,
+    )
+    
 
     # --- Placeholder response ---
-    reply = (
-        f"[RAG Placeholder] You asked: \"{user_message}\". "
-        "Connect your retrieval pipeline and LLM in app.py → /chat to get real answers from your uploaded PDFs."
-    )
+
+    reply = response.choices[0].message.content
 
     return jsonify({
         'reply': reply,
